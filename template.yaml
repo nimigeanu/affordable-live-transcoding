@@ -1,0 +1,758 @@
+Parameters:
+  StandbyPoolSize:
+    Description: Number of unused transcoders to be kept on standby
+    Type: Number
+    Default: 0
+  TranscoderWatchdog:
+    Description: If true, transcoders will be monitored and cleaned up, unless explicitly kept alive via periodic API calls
+    Default: false
+    Type: String
+    AllowedValues: [true, false]
+Conditions:
+  HasWatchdog:
+    !Equals [true, !Ref TranscoderWatchdog]
+
+Resources:
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-LambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
+      Policies:
+        -
+          PolicyName: !Sub "${AWS::StackName}-InvokeLambdaPolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "lambda:InvokeAsync"
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+        -
+          PolicyName: !Sub "${AWS::StackName}-MediaLiveAccessPolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "medialive:*"
+                Resource: "*"
+        -
+          PolicyName: !Sub "${AWS::StackName}-PassRolePolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Join ["", ["arn:aws:iam::", Ref: "AWS::AccountId", ":role/*"]]
+        -
+          PolicyName: !Sub "${AWS::StackName}-LoggingPolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Join ["", ["arn:aws:logs:", Ref: "AWS::Region", ":", Ref: "AWS::AccountId", ":log-group:/aws/lambda/*"]]
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-StepFunctionsRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
+      - arn:aws:iam::aws:policy/AWSLambdaFullAccess
+
+  MediaLiveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-MediaLiveRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "medialive.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+      Policies:
+        -
+          PolicyName: "MediaLiveCustomPolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "mediastore:ListContainers"
+                  - "mediastore:PutObject"
+                  - "mediastore:GetObject"
+                  - "mediastore:DeleteObject"
+                  - "mediastore:DescribeObject"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                  - "logs:DescribeLogGroups"
+                Resource: "arn:aws:logs:*:*:*"
+
+  LambdaInvokePermission1:
+    Type: AWS::Lambda::Permission
+    Condition: HasWatchdog
+    Properties:
+      FunctionName: !Ref UnassignStrayTranscodersFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupStrayTransocodersRule.Arn
+
+  LambdaInvokePermission2:
+    Type: AWS::Lambda::Permission
+    Condition: HasWatchdog
+    Properties:
+      FunctionName: !Ref SizeTranscoderPoolFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupStrayTransocodersRule.Arn
+
+  InputSecurityGroup:
+    Type: AWS::MediaLive::InputSecurityGroup
+    Properties: 
+      WhitelistRules: 
+        - Cidr: 0.0.0.0/0
+
+  AssignTranscoderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-AssignTranscoder
+      Description: looks for and returns an active Transcoder, if none, tries to find and return a transcoder that's still inititializing; otherwise, calls for a new transcoder to be created and returns an error
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/assign-transcoder.zip"
+      Environment:
+        Variables:
+          DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
+          SIZE_TRANSCODER_POOL_FUNCTION: !Sub ${AWS::StackName}-SizeTranscoderPool
+          MEDIA_STORE_DESTINATION_PREFIX: !Sub 
+            - https://${domain}/
+            - { domain : !Select [1, !Split ["//", !GetAtt Container.Endpoint]]}
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  CreateTranscoderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CreateTranscoder
+      Description: creeates a new transcoder
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/create-transcoder.zip"
+      Environment:
+        Variables:
+          CODE_NAME : !Sub ${AWS::StackName}
+          INPUT_SECURITY_GROUP: !Ref InputSecurityGroup
+          MEDIA_LIVE_ROLE: !GetAtt MediaLiveRole.Arn
+          MEDIA_STORE_DESTINATION_PREFIX: !Sub 
+                - mediastoressl://${domain}/
+                - { domain : !Select [1, !Split ["//", !GetAtt Container.Endpoint]]}
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  KeepTranscoderAliveFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-KeepTranscoderAlive
+      Description: marks a transcoder to be kept alive; in "watchdog" mode, transcoders that are not constantly "kept alive" will be closed
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/keep-transcoder-alive.zip"
+      Environment:
+        Variables:
+          DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  SizeTranscoderPoolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-SizeTranscoderPool
+      Description: adds or removes transcoders to meet required demand
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/size-transcoder-pool.zip"
+      Environment:
+        Variables:
+          STANDBY_POOL_SIZE: !Ref StandbyPoolSize
+          DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
+          SETUP_TRANSCODER_SM: !Ref SetupTranscoderStateMachine
+          DESTROY_TRANSCODER_SM: !Ref DestroyTranscoderStateMachine
+          DELAY_SIZE_TRANSCODER_POOL_SM: !Ref DelaySizeTranscoderPoolStateMachine
+
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  StopChannelUntilIdleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-StopChannelUntilIdle
+      Description: utility to monitor a channel state via step functions
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/stop-channel-until-idle.zip"
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  UnassignStrayTranscodersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-UnassignStrayTranscoders
+      Description: unassigns transcoder that have not been "kept alive" in "watchdog" mode
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/unassign-stray-transcoders.zip"
+      Environment:
+        Variables:
+          DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  UnassignTranscoderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-UnassignTranscoder
+      Description: detaches a transcoder from a stream
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/unassign-transcoder.zip"
+      Environment:
+        Variables:
+          DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
+          SIZE_TRANSCODER_POOL_FUNCTION: !Sub ${AWS::StackName}-SizeTranscoderPool
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  GetCurrentTimeEpochFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-GetCurrentTimeEpoch
+      Description: returns current time, used for timeout purposes
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/get-current-time-epoch.zip"
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  DeleteTranscoderChannelFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-DeleteTranscoderChannel
+      Description: deletes a MediaLive Channel
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/delete-transcoder-channel.zip"
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  DeleteTranscoderInputFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-DeleteTranscoderInput
+      Description: deletes a MediaLive Input
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/delete-transcoder-input.zip"
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  StartChannelUntilRunningFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-StartChannelUntilRunning
+      Description: utility to monitor a channel state via step functions
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: lostshadow
+        S3Key: "affordable-live-transcoding/lambda/start-channel-until-running.zip"
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  DelaySizeTranscoderPoolStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-DelaySizeTranscoderPool
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "WaitSomeSeconds",
+          "States": {
+            "WaitSomeSeconds": {
+              "Type": "Wait",
+              "SecondsPath": "$.Seconds",
+              "Next": "CallSizeTranscoderPool"
+            },
+            "CallSizeTranscoderPool": {
+              "Type": "Task",
+              "Parameters": {
+                "LastOp": "WAIT"
+              },
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-SizeTranscoderPool",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+
+  DestroyTranscoderStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-DestroyTranscoder
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "GetItemFromDB",
+          "States": {
+            "GetItemFromDB": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:getItem",
+              "Parameters": {
+                "TableName": "${AWS::StackName}-Transcoders",
+                "Key": {
+                  "ChannelId": {
+                    "S.$": "$.ChannelId"
+                  }
+                }
+              },
+              "Next": "DeleteItemFromDB"
+            },
+            "DeleteItemFromDB": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:deleteItem",
+              "Parameters": {
+                "TableName": "${AWS::StackName}-Transcoders",
+                "Key": {
+                  "ChannelId": {
+                    "S.$": "$.Item.ChannelId.S"
+                  }
+                }
+              },
+              "ResultPath": "$.taskresult",
+              "Next": "StopChannelAndWaitForIdle"
+            },
+            "StopChannelAndWaitForIdle": {
+              "Type": "Task",
+              "Resource": "${StopChannelUntilIdleFunction.Arn}",
+              "Parameters": {
+                "ChannelId.$": "$.Item.ChannelId.S"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Error"],
+                  "IntervalSeconds": 20,
+                  "MaxAttempts": 20,
+                  "BackoffRate": 1.1
+                }
+              ],
+              "ResultPath": "$.taskresult",
+              "Next": "DestroyTranscoderChannel"
+            },
+            "DestroyTranscoderChannel": {
+              "Type": "Task",
+              "Parameters": {
+                "ChannelId.$": "$.Item.ChannelId.S"
+              },
+              "Resource": "${DeleteTranscoderChannelFunction.Arn}",
+              "ResultPath": "$.taskresult",
+              "Next": "DestroyTranscoderInput"
+            },
+            "DestroyTranscoderInput": {
+              "Type": "Task",
+              "Parameters": {
+                "InputId.$": "$.Item.InputId.S"
+              },
+              "Resource": "${DeleteTranscoderInputFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["ConflictException"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 10,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+
+  SetupTranscoderStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-SetupTranscoder
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "CreateTranscoder",
+          "States": {
+            "CreateTranscoder": {
+              "Type": "Task",
+              "Resource": "${CreateTranscoderFunction.Arn}",
+              "ResultPath": "$.Transcoder",
+              "Next": "GetCurrentTime"
+            },
+            "GetCurrentTime": {
+              "Type": "Task",
+              "Resource": "${GetCurrentTimeEpochFunction.Arn}",
+              "ResultPath": "$.currentTime",
+              "Next": "SaveTranscoder1"
+            },
+            "SaveTranscoder1": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${AWS::StackName}-Transcoders",
+                "Item": {
+                  "ChannelId": {
+                    "S.$": "$.Transcoder.ChannelId"
+                  },
+                  "InputId": {
+                    "S.$": "$.Transcoder.InputId"
+                  },
+                  "IngestUri": {
+                    "S.$": "$.Transcoder.IngestUri"
+                  },
+                  "Running": {
+                    "S": "NO"
+                  },
+                  "StreamName": {
+                    "S": "null"
+                  }
+                }
+              },
+              "ResultPath": "$.taskresult",
+              "Next": "StartChannelAndWaitForRunning"
+            },
+            "StartChannelAndWaitForRunning": {
+              "Type": "Task",
+              "Resource": "${StartChannelUntilRunningFunction.Arn}",
+              "Parameters": {
+                "ChannelId.$": "$.Transcoder.ChannelId"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["ConflictException"],
+                  "IntervalSeconds": 20,
+                  "MaxAttempts": 20,
+                  "BackoffRate": 1.1
+                },
+                {
+                  "ErrorEquals": ["Error"],
+                  "IntervalSeconds": 20,
+                  "MaxAttempts": 20,
+                  "BackoffRate": 1.1
+                }
+              ],
+              "ResultPath": "$.taskresult",
+              "Next": "SaveTranscoder2"
+            },
+            "SaveTranscoder2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${AWS::StackName}-Transcoders",
+                "Key": {
+                  "ChannelId": {
+                    "S.$": "$.Transcoder.ChannelId"
+                  }
+                },
+                "UpdateExpression": "SET Running = :myValueRef",
+                "ExpressionAttributeValues": {
+                  ":myValueRef": {
+                    "S": "YES"
+                  }
+                }
+              },
+              "ResultPath": "$.taskresult",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+
+  Container:
+    Type: AWS::MediaStore::Container
+    Properties: 
+      AccessLoggingEnabled: false
+      ContainerName: !Sub ${AWS::StackName}-Container
+      CorsPolicy: 
+        - AllowedHeaders: 
+            - "*"
+          AllowedMethods: 
+            - GET
+            - HEAD
+          AllowedOrigins: 
+            - "*"
+          MaxAgeSeconds: 3000
+      Policy: 
+        !Sub |
+          {
+            "Version" : "2012-10-17",
+            "Statement" : [ {
+              "Sid" : "MediaStoreFullAccess",
+              "Effect" : "Allow",
+              "Principal" : {
+                "AWS" : "arn:aws:iam::${AWS::AccountId}:root"
+              },
+              "Action" : "mediastore:*",
+              "Resource" : "arn:aws:mediastore:us-east-1:${AWS::AccountId}:container/${AWS::StackName}-Container/*",
+              "Condition" : {
+                "Bool" : {
+                  "aws:SecureTransport" : "true"
+                }
+              }
+            }, 
+            {
+              "Sid" : "PublicReadOverHttps",
+              "Effect" : "Allow",
+              "Principal" : "*",
+              "Action" : [ "mediastore:GetObject", "mediastore:DescribeObject" ],
+              "Resource" : "arn:aws:mediastore:us-east-1:${AWS::AccountId}:container/${AWS::StackName}-Container/*",
+              "Condition" : {
+                "Bool" : {
+                  "aws:SecureTransport" : "true"
+                }
+              }
+            } ]
+          }
+
+  TranscodersTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      TableName: !Sub ${AWS::StackName}-Transcoders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: 
+        - 
+          AttributeName: "ChannelId"
+          AttributeType: "S"
+        - 
+          AttributeName: "StreamName"
+          AttributeType: "S"
+        - 
+          AttributeName: "Running"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "ChannelId"
+          KeyType: "HASH"
+      GlobalSecondaryIndexes: 
+        - 
+          IndexName: "StreamName-index"
+          KeySchema: 
+            - 
+              AttributeName: "StreamName"
+              KeyType: "HASH"
+          Projection: 
+            ProjectionType: "ALL"
+        - 
+          IndexName: "Running-StreamName-index"
+          KeySchema: 
+            - 
+              AttributeName: "Running"
+              KeyType: "HASH"
+            - 
+              AttributeName: "StreamName"
+              KeyType: "RANGE"
+          Projection: 
+            ProjectionType: "ALL"
+
+  CleanupStrayTransocodersRule:
+    Type: AWS::Events::Rule
+    Condition: HasWatchdog
+    Properties: 
+      Name: !Sub ${AWS::StackName}-CleanupStrayTransocodersRule
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: 
+            !GetAtt UnassignStrayTranscodersFunction.Arn
+          Id: !Sub ${AWS::StackName}-UnassignStrayTranscodersTarget
+        -
+          Arn: 
+            !GetAtt SizeTranscoderPoolFunction.Arn
+          Id: !Sub ${AWS::StackName}-SizeTranscoderPoolTarget
+
+  ApiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: !Sub ${AWS::StackName}-API
+      Description: "The API"
+      Policy:
+        !Sub |
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "execute-api:Invoke",
+                    "Resource": "arn:aws:execute-api:us-east-1:${AWS::AccountId}:*/*/*/*",
+                    "Condition": {
+                        "IpAddress": {
+                            "aws:SourceIp": [
+                                "0.0.0.0/0",
+                                "1.2.3.4"
+                            ]
+                        }
+                    }
+                }
+            ]
+          }
+
+  ApiTranscodersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'transcoders'
+      RestApiId: !Ref ApiGateway
+  
+  ApiTranscodersIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ApiTranscodersResource
+      PathPart: '{streamName}'
+      RestApiId: !Ref ApiGateway
+
+  ApiNewTranscoderMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "GET"
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "AssignTranscoderFunction.Arn"
+      ResourceId: !Ref ApiTranscodersIdResource
+      RestApiId: !Ref "ApiGateway"
+
+  LambdaApiGatewayInvoke1:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt AssignTranscoderFunction.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/transcoders/{streamName}"
+
+  ApiKeepTranscoderMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "PUT"
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "KeepTranscoderAliveFunction.Arn"
+      ResourceId: !Ref ApiTranscodersIdResource
+      RestApiId: !Ref "ApiGateway"
+
+  LambdaApiGatewayInvoke2:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt KeepTranscoderAliveFunction.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/PUT/transcoders/{streamName}"
+
+  ApiDeleteTranscoderMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "DELETE"
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "UnassignTranscoderFunction.Arn"
+      ResourceId: !Ref ApiTranscodersIdResource
+      RestApiId: !Ref "ApiGateway"
+
+  LambdaApiGatewayInvoke3:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt UnassignTranscoderFunction.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/DELETE/transcoders/{streamName}"
+
+  ApiGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - ApiNewTranscoderMethod
+      - ApiKeepTranscoderMethod
+      - ApiDeleteTranscoderMethod
+    Properties:
+      RestApiId: !Ref "ApiGateway"
+      StageName: !Sub ${AWS::StackName}-api
+
+Outputs:
+  ApiEndpoint:
+    Description: URL of the API entry point, use to call API functions
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${AWS::StackName}-api"
