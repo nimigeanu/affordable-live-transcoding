@@ -1,3 +1,5 @@
+Description: Coordinated Live Transcoding driven by AWS MediaLive
+
 Parameters:
   StandbyPoolSize:
     Description: Number of unused transcoders to be kept on standby
