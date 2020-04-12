@@ -176,7 +176,7 @@ Resources:
           MEDIA_STORE_DESTINATION_PREFIX: !Sub 
             - https://${domain}/
             - { domain : !Select [1, !Split ["//", !GetAtt Container.Endpoint]]}
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   CreateTranscoderFunction:
@@ -197,7 +197,7 @@ Resources:
           MEDIA_STORE_DESTINATION_PREFIX: !Sub 
                 - mediastoressl://${domain}/
                 - { domain : !Select [1, !Split ["//", !GetAtt Container.Endpoint]]}
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   KeepTranscoderAliveFunction:
@@ -213,7 +213,7 @@ Resources:
       Environment:
         Variables:
           DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   SizeTranscoderPoolFunction:
@@ -234,7 +234,7 @@ Resources:
           DESTROY_TRANSCODER_SM: !Ref DestroyTranscoderStateMachine
           DELAY_SIZE_TRANSCODER_POOL_SM: !Ref DelaySizeTranscoderPoolStateMachine
 
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   StopChannelUntilIdleFunction:
@@ -247,7 +247,7 @@ Resources:
       Code:
         S3Bucket: lostshadow
         S3Key: "affordable-live-transcoding/lambda/stop-channel-until-idle.zip"
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   UnassignStrayTranscodersFunction:
@@ -263,7 +263,7 @@ Resources:
       Environment:
         Variables:
           DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   UnassignTranscoderFunction:
@@ -280,7 +280,7 @@ Resources:
         Variables:
           DYNAMODB_TRANSCODERS_TABLE : !Sub ${AWS::StackName}-Transcoders
           SIZE_TRANSCODER_POOL_FUNCTION: !Sub ${AWS::StackName}-SizeTranscoderPool
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   GetCurrentTimeEpochFunction:
@@ -293,7 +293,7 @@ Resources:
       Code:
         S3Bucket: lostshadow
         S3Key: "affordable-live-transcoding/lambda/get-current-time-epoch.zip"
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   DeleteTranscoderChannelFunction:
@@ -306,7 +306,7 @@ Resources:
       Code:
         S3Bucket: lostshadow
         S3Key: "affordable-live-transcoding/lambda/delete-transcoder-channel.zip"
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   DeleteTranscoderInputFunction:
@@ -319,7 +319,7 @@ Resources:
       Code:
         S3Bucket: lostshadow
         S3Key: "affordable-live-transcoding/lambda/delete-transcoder-input.zip"
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   StartChannelUntilRunningFunction:
@@ -332,7 +332,7 @@ Resources:
       Code:
         S3Bucket: lostshadow
         S3Key: "affordable-live-transcoding/lambda/start-channel-until-running.zip"
-      Runtime:  nodejs8.10
+      Runtime:  nodejs12.x
       Timeout: 180
 
   DelaySizeTranscoderPoolStateMachine:
